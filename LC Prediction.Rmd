@@ -1,0 +1,1009 @@
+---
+title: "Assignment 2"
+author: "Akash Bunde"
+date: "10/15/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(lubridate)
+library(ROCR)
+library(data.table)
+library(expss)
+library(ggplot2)
+library(ranger)
+library(dplyr)
+library(splitstackshape)
+library(caret)
+library(rpart)
+library(base)
+library(broom)
+library(ROSE)
+library(glmnet)
+library(rsq)
+library(doParallel)
+library(xgboost)
+
+registerDoParallel(16)
+
+```
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r}
+
+lcdf <- read_csv('lcdata100K/lcData100K.csv')
+
+```
+```{r}
+# Getting 'actualTerm' and 'annualRet'
+
+lcdf$last_pymnt_d_new1<-paste(lcdf$last_pymnt_d, "-01", sep = "")
+lcdf$last_pymnt_d_new1<-parse_date_time(lcdf$last_pymnt_d_new1,  "myd")
+
+lcdf$actualTerm <- ifelse(lcdf$loan_status=="Fully Paid", as.duration(lcdf$issue_d  %--% lcdf$last_pymnt_d_new1)/dyears(1), 3)
+
+
+lcdf$annualRet <- ifelse(lcdf$actualTerm>0, ((lcdf$total_pymnt - lcdf$funded_amnt) / lcdf$funded_amnt) * (1/lcdf$actualTerm) * 100, 0)
+
+```
+
+## Handling Missing Value
+
+```{r echo=TRUE}
+# seeing missing values proportions
+#names(lcdf)[colSums(is.na(lcdf))>0]
+
+#Removing columns with all empty rows
+lcdf <- lcdf %>% subset(select = c(names(lcdf)[colSums(!is.na(lcdf))>0]))
+
+lcdf<- lcdf %>% replace_na(list(num_rev_accts=median(lcdf$num_rev_accts, na.rm=TRUE)
+                                , revol_util=median(lcdf$revol_util,na.rm=TRUE)
+                                ,hardship_dpd= median(lcdf$hardship_dpd, na.rm=TRUE)
+                                ,settlement_term= median(lcdf$settlement_term, na.rm=TRUE)
+                                ,il_util=median(lcdf$il_util, na.rm=TRUE)
+                                ,max_bal_bc=median(lcdf$max_bal_bc, na.rm=TRUE)
+                                ,all_util=median(lcdf$all_util, na.rm=TRUE)
+                                ,inq_fi=median(lcdf$inq_fi, na.rm=TRUE)
+                                ,total_cu_tl=median(lcdf$total_cu_tl, na.rm=TRUE)
+                                ,bc_util=median(lcdf$bc_util, na.rm=TRUE)
+                                ,bc_open_to_buy=median(lcdf$bc_open_to_buy, na.rm=TRUE)
+                                ,avg_cur_bal=median(lcdf$avg_cur_bal, na.rm=TRUE)
+                                ,pct_tl_nvr_dlq= 0,mtths_since_recent_bc= 0,mths_since_recent_inq = 0
+                                ,open_acc_6m=0, open_act_il=0, open_il_12m=0, open_il_24m=0,total_bal_il=0
+                                ,open_rv_12m=0, open_rv_24m=0, inq_last_12m=0, mths_since_last_record=0
+                                ,mths_since_recent_bc_dlq=0, mths_since_last_major_derog=0
+                                ,mths_since_recent_revol_delinq=0,mths_since_last_delinq=0
+                                ,num_tl_120dpd_2m=0, mo_sin_old_il_acct=0,bc_util=0
+                                ,percent_bc_gt_75=0, bc_open_to_buy=0, mths_since_rcnt_il=0
+                                ,mths_since_recent_bc=0,emp_title="missing"
+                                ,purpose= "missing", title="missing" , last_pymnt_d ="missing"
+                                ,last_pymnt_d_new1 ="1970-01-01", annualRet=0))
+
+dim(lcdf)
+
+
+```
+
+## Removing data leakage variables
+
+```{r}
+##identifying numeric columns
+#num_col <- unlist(lapply(lcdf, is.numeric))  
+#data_num <- lcdf[ , num_col]                      
+
+##identifying character columns
+cha_col <- unlist(lapply(lcdf, is.character))
+#data_cha<- lcdf[ , cha_col]
+
+#converting datatype from character to factor
+lcdf[ , cha_col] <- lapply(lcdf[ , cha_col], as.factor)
+
+#combining the two types of columns
+#nData<-cbind(data_num, data_cha)
+
+
+#data_num = ''
+#data_cha = ''
+ 
+
+
+##Removing Leakage variables (LR-Leakage removed)
+drops <- c("hardship_start_date","hardship_end_date","deferral_term","hardship_amount","hardship_status","hardship_type"
+           ,"hardship_reason","sec_app_mths_since_last_major_derog","sec_app_collections_12_mths_ex_med"
+           ,"sec_app_chargeoff_within_12_mths","sec_app_num_rev_accts","sec_app_open_act_il","sec_app_revol_util"
+           ,"sec_app_open_acc","sec_app_mort_acc","sec_app_inq_last_6mths","sec_app_earliest_cr_line","revol_bal_joint"
+           ,"annual_inc_joint","next_pymnt_d","url","desc","orig_projected_additional_accrued_interest"
+           ,"payment_plan_start_date","settlement_status","settlement_amount","hardship_payoff_balance_amount"
+           ,"hardship_loan_status","hardship_length","settlement_percentage","debt_settlement_flag_date"
+           ,"hardship_last_payment_amount","id", "member_id","recoveries", "collection_recovery_fee", "last_credit_pull_d"
+           ,"debt_settlement_flag","total_rec_prncp", "total_pymnt"
+           ,"total_pymnt_inv","total_rec_int","issue_d","last_pymnt_amnt"
+           ,"last_pymnt_d", "total_rec_late_fee","funded_amnt", "installment", 'prop_amt_rec'
+           ,'loss', 'prop_act_rev_acc', 'funded_amnt_inv', 'avg_cur_bal'
+           ,'bc_util', 'tot_cur_bal', 'num_rev_tl_bal_gt_0', 'term', 'title', 'pymnt_plan', 'hardship_flag'
+           ,'disbursement_method','emp_title', 'last_pymnt_d_new1', 'last_pymnt_d_new','settlement_term')
+
+nDataLR <- lcdf[ , !(names(lcdf) %in% drops)]
+
+dim(nDataLR)
+
+```
+## Dividing into test and train dataset
+
+```{r}
+#setting seed value to get same sample every time for comparison
+set.seed(10)
+
+nr=nrow(nDataLR)
+
+trnIndex = sample(1:nr, size = round(0.7*nr), replace=FALSE) #get a random 70%sample of row-indices
+
+bs_nDataTrn=nDataLR[ trnIndex, ] #training data with the randomly selected row-indices
+nDataTst = nDataLR[ -trnIndex, ] #test data with the other row-indices
+nDataTrn = bs_nDataTrn
+
+# Balancing the data by over/under sampling
+#bs_nDataTrn <- ovun.sample(loan_status~., data = as.data.frame(nDataTrn), na.action= na.pass, method="both", p=0.5,
+#                           seed = 10)$data
+
+```
+
+## 1. (a) Develop boosted tree models (using either gbm or xgBoost) to predict loan_status. Experiment with different parameters using a grid of parameter values. Use cross-validation. Explain the rationale for your experimentation. How does performance vary with parameters, and which parameter setting you use for the 'best' model.
+Model performance should be evaluated through use of same set of criteria as for the earlier models - confusion matrix based, ROC analyses and AUC, cost-based performance.
+Provide a table with comparative evaluation of all the best models from each methods; show their ROC curves in a combined plot. Also provide profit-curves and 'best' profit' and associated cutoff. At this cutoff, what are the accuracy values for the different models?
+
+```{r eval=FALSE}
+# Using dummyVars function to convert categorical variables into one-hot encoding
+
+fdum<-dummyVars(~.,data=nDataTrn%>% select(-loan_status)) #do not include loan_statusfor this
+
+dxlcdfTrn<-predict(fdum, nDataTrn)
+
+dylcdftrn <- class2ind(nDataTrn$loan_status, drop2nd = FALSE)
+
+# keeping fully paid as label of interest
+colcdfTrn<-dylcdftrn[ , 2]
+
+#Test dataset
+fdum<-dummyVars(~.,data=nDataTst%>% select(-loan_status)) #do not include loan_status for this
+
+dxlcdfTst<-predict(fdum, nDataTst)
+
+dylcdftst <- class2ind(nDataTst$loan_status, drop2nd = FALSE)
+
+# keeping fully paid as label of interest
+colcdfTst<-dylcdftst[ , 2]
+
+lsdxTrn<-xgb.DMatrix( subset(dxlcdfTrn, select=-c(annualRet, actualTerm)), label=colcdfTrn)
+lsdxTst<-xgb.DMatrix( subset( dxlcdfTst,select=-c(annualRet, actualTerm)), label=colcdfTst)
+
+xgbWatchlist <- list(train = lsdxTrn, eval = lsdxTst)
+
+xgbParamGrid <- expand.grid(
+max_depth = c(5, 7),
+eta = c(0.01, 0.05, 0.1) )
+
+xgbParams <- list (
+objective = "binary:logistic",
+eval_metric="error", eval_metric="auc",
+eta=0.01, #learning rate
+max_depth=5,
+min_child_weight=1,
+colsample_bytree=0.6
+)
+
+xgb_tune<- xgb.cv(data=lsdxTrn, objective = "binary:logistic", nrounds=50, eta=0.5, max_depth=5, early_stopping_rounds = 10, nfold=5, eval_metric="auc")
+
+for(i in 1:nrow(xgbParamGrid)) {
+  
+xgb_tune<- xgb.cv(data=lsdxTrn, objective = "binary:logistic", nrounds=200, eta=xgbParamGrid$eta[i], max_depth=xgbParamGrid$max_depth[i], early_stopping_rounds = 10, nfold=5, eval_metric="auc")
+
+xgbParamGrid$bestTree[i] <- xgb_tune$evaluation_log[xgb_tune$best_iteration]$iter
+xgbParamGrid$bestPerf[i] <- xgb_tune$evaluation_log[xgb_tune$best_iteration]$test_auc_mean
+}
+
+
+write_csv(xgbParamGrid, 'xgb_param.csv')
+
+ls_xgb_best <- xgb.train(data=lsdxTrn, objective = "binary:logistic", watchlist = xgbWatchlist, nrounds=200, eta=0.05, max_depth=5, early_stopping_rounds = 10, eval_metric="auc")
+1
+
+
+```
+
+# Performance measures
+```{r}
+xpredTst<-predict(ls_xgb_best, lsdxTst)
+
+#confusion matrix
+table(pred=as.numeric(xpredTst>0.5), act=colcdfTst)
+
+pred_xgb_lsM1<-prediction(xpredTst, nDataTst$loan_status, label.ordering = c("Charged Off", "Fully Paid"))
+
+aucPerf_xgb_lsM1<-performance(pred_xgb_lsM1, "tpr", "fpr")
+plot(aucPerf_xgb_lsM1)
+abline(a=0, b= 1)
+
+#variable importance
+write_csv(xgb.importance(model = ls_xgb_best), 'xgb_varimp.csv')
+
+
+# Profit calculation
+PROFITVAL <-18.82
+COSTVAL <-35.88
+
+#Performance
+scoreTstRF<-xpredTst
+
+prPerfRF<-data.frame(scoreTstRF)
+prPerfRF<-cbind(prPerfRF, status=lcdfTst$loan_status)
+prPerfRF<-prPerfRF[order(-scoreTstRF) ,] #sort in descorder of prob(fully_paid)
+prPerfRF$profit<-ifelse(prPerfRF$status== 'Fully Paid', PROFITVAL, COSTVAL)
+prPerfRF$cumProfit<-cumsum(prPerfRF$profit)
+max(prPerfRF$cumProfit)
+prPerfRF$cumProfit[which.max(prPerfRF$cumProfit)]
+
+
+
+```
+# Random Forest
+```{r}
+ls_rf <- ranger(loan_status~., data=nDataTrn%>% select(-annualRet, -actualTerm), num.trees =200, importance='permutation',
+                probability = TRUE, mtry=2)
+
+predTst <- predict(ls_rf,nDataTst)
+
+#now apply the prediction function from ROCR to get a prediction object
+rocPredTst <- prediction(predTst$predictions[, 'Charged Off'] , ifelse(nDataTst$loan_status == "Charged Off",1,0))
+
+
+#obtain performance using the function from ROCR, then plot
+perfROCTst <- performance(rocPredTst, "tpr", "fpr")
+plot(perfROCTst)
+
+```
+
+
+
+## 2. (a) Develop linear (glm) models to predict loan_status. Experiment with different parameter values, and identify which gives ‘best’ performance. Use cross-validation. Describe how you determine ‘best’ performance. How do you handle variable selection? Experiment with Ridge and Lasso, and show how you vary these parameters, and what performance is observed. 
+(b) For the linear model, what is the loss function, and link function you use ? (Write the expression for these, and briefly describe).
+(c) Compare performance of models with that of random forests (from last assignment) and gradient boosted tree models.
+(d) Examine which variables are found to be important by the best models from the different methods, and comment on similarities, difference. What do you conclude?
+(e) In developing models above, do you find larger training samples to give better models ? Do you find balancing the training data examples across classes to give better models ?
+
+```{r}
+yTrn<-factor(ifelse(nDataTrn$loan_status=="Fully Paid" , '1', '0') )
+yTst<-factor(ifelse(nDataTst$loan_status=="Fully Paid" , '1', '0') )
+xTrn<- nDataTrn%>% select(-annualRet, -actualTerm, -loan_status)
+xTst<- nDataTst%>% select(-annualRet, -actualTerm, -loan_status)
+#GLM model for predicting the Loan_status of Lending Club data.
+#the model for the data unbalanced data.
+glmls_cv<- cv.glmnet(data.matrix(xTrn), yTrn, family="binomial")
+glmls_cv$lambda.min
+glmls_cv$lambda.1se
+#Binomial Deviance of the GLM model
+
+print.cv.glmnet(glmls_cv)
+
+coef(glmls_cv, s = glmls_cv$lambda.min)
+
+coef(glmls_cv, s = glmls_cv$lambda.1se)
+
+as.matrix(coef(glmls_cv, s = glmls_cv$lambda.1se))
+glmls_cv$glmnet.fit
+which(glmls_cv$lambda == glmls_cv$lambda.1se)
+
+glmls_cv$glmnet.fit$dev.ratio[which(glmls_cv$lambda == glmls_cv$lambda.1se) ]
+#Plot of Coefficients w.r.t. Lnorm
+plot(glmls_cv$glmnet.fit)
+plot(glmls_cv$glmnet.fit, xvar="lambda")
+#rmse(nDataTrn$loan_status, glmls_cv)
+```
+
+#Predictions
+```{r}
+
+glmPredls_1=predict ( glmls_cv,data.matrix(xTrn), s="lambda.min" ) # gives the ln(p/(1-p)) values
+#i.e. the values of w1*x1 + ...+w2*x2
+
+glmPredls_p=predict(glmls_cv,data.matrix(xTrn), s="lambda.min", type="response") #gives the prob values
+glmPredls_2=predict(glmls_cv,data.matrix(xTst), s="lambda.min", type="response")
+predsauc <- prediction(glmPredls_p, nDataTrn$loan_status, label.ordering = c("Charged Off", "Fully Paid"))
+aucPerf <- performance(predsauc, "auc")
+aucPerf
+aucPerf@y.values
+
+#er_glm<- rmse(nDataTrn,predsauc )
+# performance of GLM model 
+#prediction and AUC on Test Data
+glm_tst_pred<- predict(glmls_cv,data.matrix(xTst), s="lambda.min", type="response")
+glm_tst_auc<- prediction(glm_tst_pred, nDataTst$loan_status, label.ordering = c("Charged Off", "Fully Paid"))
+glm_tst_aucPerf <- performance(glm_tst_auc, "auc")
+glm_tst_aucPerf@y.values
+
+#confusion Matrix on Training Data:
+confusionMatrix(factor(if_else( glmPredls_p>0.6, '1', '0')), yTrn, positive = "1")
+#confusion Matrix on Training Data:
+confusionMatrix(factor(if_else( glmPredls_2>0.6, '1', '0')), yTst, positive = "1")
+
+#as the data is unbalanced, we will assign weights
+wts = if_else(yTrn == 0, 1-sum(yTrn==0)/length(yTrn), 1-sum(yTrn==1)/length(yTrn))
+glm_wts<- cv.glmnet(data.matrix(xTrn), yTrn, family="binomial", weights = wts)
+plot(glm_wts)
+glm_wts$lambda.min
+#performance of model on the balanced data
+glm_wts_pred<- predict(glm_wts,data.matrix(xTst), s="lambda.min", type="response")
+glm_wts_auc<- prediction(glm_wts_pred, nDataTst$loan_status, label.ordering = c("Charged Off", "Fully Paid"))
+glm_wts_aucPerf <- performance(glm_wts_auc, "auc")
+glm_wts_aucPerf@y.values
+```
+
+Cross-Validation
+```{r}
+glmls_cv_auc<- cv.glmnet(data.matrix(xTrn), yTrn, family="binomial")
+plot(glmls_cv_auc)
+#the labmda values used are in glmls_cv$lambda
+glmls_cv_auc$lambda
+# and the cross-validation 'loss' at each lambda is in glmls_cv$cvm
+glmls_cv_auc$cvm
+#So, to get the 'loss' value at lambda == lambda.1se
+glmls_cv_auc$cvm [ which(glmls_cv_auc$lambda == glmls_cv_auc$lambda.1se) ]
+```
+
+Varying the Parameters
+```{r}
+# set alpha as 0 for RIDGE Regression 
+glm_rid<- cv.glmnet(data.matrix(xTrn), yTrn, family="binomial", alpha=0)
+plot(glm_rid)
+glm_rid$lambda.1se
+glm_rid$lambda.min
+#prediction and AUC on Training Data 
+glm_rid_Predls_p <- predict(glm_rid,data.matrix(xTrn), s="lambda.min", type="response" )
+pred_rid_auc <- prediction(glm_rid_Predls_p, nDataTrn$loan_status, label.ordering = c("Charged Off", "Fully Paid"))
+auc_rid_Perf <- performance(pred_rid_auc, "auc")
+auc_rid_Perf
+auc_rid_Perf@y.values
+
+
+#prediction and AUC on Test Data
+glm_rid_pred<- predict(glm_rid,data.matrix(xTst), s="lambda.min", type="response")
+glm_rid_auc<- prediction(glm_rid_pred, nDataTst$loan_status, label.ordering = c("Charged Off", "Fully Paid"))
+glm_rid_aucPerf <- performance(glm_rid_auc, "auc")
+glm_rid_aucPerf@y.values
+
+
+#confusion Matrix on Training Data:
+confusionMatrix(factor(if_else( glm_rid_Predls_p >0.6, '1', '0')), yTrn, positive = "1")
+#confusion Matrix on Training Data:
+confusionMatrix(factor(if_else( glm_rid_pred>0.6, '1', '0')), yTst, positive = "1")
+
+#as the data is unbalanced, we will assaign weights
+wts = if_else(yTrn == 0, 1-sum(yTrn==0)/length(yTrn), 1-sum(yTrn==1)/length(yTrn))
+glm_wts1<- cv.glmnet(data.matrix(xTrn), yTrn, family="binomial", weights = wts, alpha=0)
+plot(glm_wts1)
+glm_wts1$lambda.min
+#performance of GLM Ridge model on balanced data
+glm_wts_pred1<- predict(glm_wts1,data.matrix(xTst), s="lambda.min", type="response")
+glm_wts_auc1<- prediction(glm_wts_pred1, nDataTst$loan_status, label.ordering = c("Charged Off", "Fully Paid"))
+glm_wts_aucPerf1 <- performance(glm_wts_auc1, "auc")
+glm_wts_aucPerf1@y.values
+```
+
+
+```{r}
+
+# set alpha as 1 for LASSO Regression 
+glm_las<- cv.glmnet(data.matrix(xTrn), yTrn, family="binomial", alpha=1)
+plot(glm_las)
+glm_las$lambda.1se
+glm_las$lambda.min
+#prediction and AUC on Training Data 
+glm_las_Predls_p=predict(glm_las,data.matrix(xTrn), s="lambda.min", type="response" )
+pred_las_auc <- prediction(glm_las_Predls_p, nDataTrn$loan_status, label.ordering = c("Charged Off", "Fully Paid"))
+auc_las_Perf <- performance(pred_las_auc, "auc")
+auc_las_Perf
+auc_las_Perf@y.values
+
+#prediction and AUC on Test Data
+glm_las_pred<- predict(glm_las,data.matrix(xTst), s="lambda.min", type="response")
+glm_las_auc<- prediction(glm_las_pred, nDataTst$loan_status, label.ordering = c("Charged Off", "Fully Paid"))
+glm_las_aucPerf <- performance(glm_las_auc, "auc")
+glm_las_aucPerf@y.values
+
+
+#confusion Matrix on Training Data:
+confusionMatrix(factor(if_else(glm_las_Predls_p>0.6, '1', '0')), yTrn, positive = "1")
+#confusion Matrix on Testing Data:
+confusionMatrix(factor(if_else( glm_las_pred>0.6, '1', '0')), yTst, positive = "1")
+
+#as the data is unbalanced, we will assaign weights
+wts = if_else(yTrn == 0, 1-sum(yTrn==0)/length(yTrn), 1-sum(yTrn==1)/length(yTrn))
+glm_wts2<- cv.glmnet(data.matrix(xTrn), yTrn, family="binomial", weights = wts, alpha=1)
+plot(glm_wts2)
+glm_wts2$lambda.min
+#performance of GLM lasso model on balanced data
+glm_wts_pred2<- predict(glm_wts1,data.matrix(xTst), s="lambda.min", type="response")
+glm_wts_auc2<- prediction(glm_wts_pred2, nDataTst$loan_status, label.ordering = c("Charged Off", "Fully Paid"))
+glm_wts_aucPerf2 <- performance(glm_wts_auc2, "auc")
+glm_wts_aucPerf2@y.values
+```
+
+```{r}
+# set alpha as 0.5 for Elastic Regression
+glm_ela<- cv.glmnet(data.matrix(xTrn), yTrn, family="binomial", alpha=0.5)
+plot(glm_ela)
+glm_ela$lambda.1se
+glm_ela$lambda.min
+#prediction and AUC on Training Data
+glm_ela_Predls_p=predict(glm_ela,data.matrix(xTrn), s="lambda.min", type="response" )
+pred_ela_auc <- prediction(glm_ela_Predls_p, nDataTrn$loan_status, label.ordering = c("Charged Off", "Fully Paid"))
+auc_ela_Perf <- performance(pred_ela_auc, "auc")
+auc_ela_Perf
+auc_ela_Perf@y.values
+
+#prediction and AUC on Test Data
+glm_ela_pred<- predict(glm_ela,data.matrix(xTst), s="lambda.min", type="response")
+glm_ela_auc<- prediction(glm_ela_pred, nDataTst$loan_status, label.ordering = c("Charged Off", "Fully Paid"))
+glm_ela_aucPerf <- performance(glm_ela_auc, "auc")
+glm_ela_aucPerf@y.values
+
+#confusion Matrix on test data
+confusionMatrix(factor(if_else( glm_ela_pred>0.6, '1', '0')), yTst, positive = "1")
+
+#as the data is unbalanced, we will assaign weights
+wts = if_else(yTrn == 0, 1-sum(yTrn==0)/length(yTrn), 1-sum(yTrn==1)/length(yTrn))
+glm_wts3<- cv.glmnet(data.matrix(xTrn), yTrn, family="binomial", weights = wts, alpha=0)
+plot(glm_wts3)
+glm_wts3$lambda.min
+
+glm_wts_pred3<- predict(glm_wts3,data.matrix(xTst), s="lambda.min", type="response")
+glm_wts_auc3<- prediction(glm_wts_pred3, nDataTst$loan_status, label.ordering = c("Charged Off", "Fully Paid"))
+glm_wts_aucPerf3 <- performance(glm_wts_auc3, "auc")
+glm_wts_aucPerf3@y.values
+
+
+# Variable Selection
+vars_nz<-coef(glm_ela, s="lambda.1se") %>% tidy()
+
+write_csv(vars_nz, 'glm_varimp.csv')
+
+dim(vars_nz)  # Only 31 variables seemed to have non zero coefficient
+
+nzCoefVars<-vars_nz[-1,1]
+
+nzCoefVars
+
+glmLs_nzv <-cv.glmnet(data.matrix(xTrn%>% select(nzCoefVars)), yTrn, family="binomial")
+
+
+```
+# ROC curves in one plot
+```{r}
+#xgboost
+perfROCTst0<-performance(pred_xgb_lsM1, "tpr", "fpr")
+plot(aucPerf_xgb_lsM1)
+
+#random Forest
+perfROCTst <- performance(rocPredTst, "tpr", "fpr")
+plot(perfROCTst)
+#vanilla
+perfROCTst1 <- performance(predsauc, "tpr", "fpr")
+plot(perfROCTst1)
+#weights
+perfROCTst2 <- performance(glm_wts_auc, "tpr", "fpr")
+plot(perfROCTst2)
+#ridge
+perfROCTst3 <- performance(pred_rid_auc, "tpr", "fpr")
+plot(perfROCTst3)
+#lasso
+perfROCTst4 <- performance(pred_las_auc, "tpr", "fpr")
+plot(perfROCTst4)
+
+abline(a=0, b= 1)
+
+plot(perfROCTst, col = 'black')
+plot(perfROCTst1, add = TRUE, col = 'red')
+plot(perfROCTst2, add = TRUE, col = 'blue')
+plot(perfROCTst3, add = TRUE, col = 'cyan')
+plot(perfROCTst4, add = TRUE, col = 'green')
+plot(perfROCTst0, add = TRUE, col = 'yellow')
+
+```
+
+
+
+## 3. Develop models to identify loans which provide the best returns. Explain how you define returns? Does it include Lending Club’s service costs? Develop glm, rf, gbm/xgb models for this. Show how you systematically experiment with different parameters to find the best models. Compare model performance – explain what performance criteria do you use, and why.
+
+# RandomForest
+
+```{r eval=FALSE}
+rfParamGrid<-expand.grid(
+num_trees= c( 200, 500, 800),
+mtry = c(2, 5, 10, 15),
+depth = c(5, 10, 15, 20))
+
+for(i in 1:nrow(rfParamGrid)) {
+    rfModel_Ret<-ranger(annualRet~., data=subset(bs_nDataTrn
+                                                 , select=-c(actualTerm, loan_status))
+                        , num.trees=rfParamGrid$num_trees[i]
+                        , importance='permutation', regularization.usedepth = TRUE
+                        ,max.depth = rfParamGrid$depth[i],mtry = rfParamGrid$mtry[i]
+                        ,seed = 10)
+    rfpredRet_Tst<-nDataTst%>% select(grade, loan_status, annualRet, actualTerm
+                                      , int_rate) %>% mutate(predRet=(predict(rfModel_Ret, nDataTst))$predictions)
+
+
+    rfParamGrid$MSE[i] = mean( (rfpredRet_Tst$predRet- nDataTst$annualRet)^2)
+}
+
+write_csv(rfParamGrid, file = 'q3_rf_pgrid.csv') 
+
+plot ( (predict(rfModel_Ret, nDataTst))$predictions, nDataTst$annualRet)
+plot ( (predict(rfModel_Ret, bs_nDataTrn))$predictions, bs_nDataTrn$annualRet)
+
+# Best model parameters
+rfModel_Ret<-ranger(annualRet~., data=subset(bs_nDataTrn, select=-c(actualTerm, loan_status))
+                        , num.trees=800
+                        , importance='permutation', regularization.usedepth = TRUE
+                        ,max.depth = 15,mtry = 15
+                        ,seed = 10)
+
+```
+
+# RF Performance on training data
+```{r}
+#Performance on Training Data
+rfpredRet_Trn<-bs_nDataTrn%>% select(grade, loan_status, annualRet, actualTerm, int_rate) %>% mutate(predRet=(predict(rfModel_Ret, bs_nDataTrn))$predictions)
+
+mean( (rfpredRet_Trn$predRet- bs_nDataTrn$annualRet)^2)
+
+rfpredRet_Trn<-rfpredRet_Trn%>% mutate(tile=ntile(-predRet, 10))
+
+rfpredRet_Trn%>% group_by(tile) %>% summarise(count=n(), avgpredRet=mean(predRet), numDefaults=sum(loan_status=="Charged Off"), avgActRet=mean(annualRet), minRet=min(annualRet), maxRet=max(annualRet), avgTer=mean(actualTerm), totA=sum(grade=="A"), totB=sum(grade=="B" ), totC=sum(grade=="C"), totD=sum(grade=="D"), totE=sum(grade=="E"), totF=sum(grade=="F") )
+
+
+```
+
+# RF Performance on test data
+```{r}
+rfpredRet_Tst<-nDataTst%>% select(grade, loan_status, annualRet, actualTerm, int_rate) %>% mutate(predRet=(predict(rfModel_Ret, nDataTst))$predictions)
+
+mean( (rfpredRet_Tst$predRet- nDataTst$annualRet)^2)
+
+rfpredRet_Tst<-rfpredRet_Tst%>% mutate(tile=ntile(-predRet, 10))
+
+write_csv(rfpredRet_Tst%>% group_by(tile) %>% summarise(count=n(), avgpredRet=mean(predRet), numDefaults=sum(loan_status=="Charged Off"), avgActRet=mean(annualRet), minRet=min(annualRet), maxRet=max(annualRet), avgTer=mean(actualTerm), totA=sum(grade=="A"), totB=sum(grade=="B" ), totC=sum(grade=="C"), totD=sum(grade=="D"), totE=sum(grade=="E"), totF=sum(grade=="F") ), 'q3_rf_ntile.csv')
+
+```
+
+## GLMnet 
+
+```{r}
+
+xD<-bs_nDataTrn%>% select(-loan_status, -actualTerm, -annualRet)
+# Alpha 0.5 for Elastic-Net penalty to combine Ridge and Lasso effects on coefficients
+
+glmParamGrid<-expand.grid(
+alpha= c( 0, 0.5, 1))
+
+# Ridge regression (alpha=0)
+glmRet_cv1<-cv.glmnet(data.matrix(xD), bs_nDataTrn$annualRet, family="gaussian"
+                       , alpha=0, parallel = TRUE, type.measure = c("mse"))
+
+# Elastic Net (Combined effect of ridge and lasso) (alpha=0.5)
+glmRet_cv2<-cv.glmnet(data.matrix(xD), bs_nDataTrn$annualRet, family="gaussian"
+                       , alpha=0.5, parallel = TRUE, type.measure = c("mse"))
+
+# Lasso regression (alpha=1)
+glmRet_cv3<-cv.glmnet(data.matrix(xD), bs_nDataTrn$annualRet, family="gaussian"
+                       , alpha=1, parallel = TRUE, type.measure = c("mse"))
+
+glmParamGrid$lambdaMin[1] = glmRet_cv1$lambda.min
+glmParamGrid$lambdaMin[2] = glmRet_cv2$lambda.min
+glmParamGrid$lambdaMin[3] = glmRet_cv3$lambda.min
+
+glmParamGrid$lambda1se[1] = glmRet_cv1$lambda.1se
+glmParamGrid$lambda1se[2] = glmRet_cv2$lambda.1se
+glmParamGrid$lambda1se[3] = glmRet_cv3$lambda.1se
+
+glmParamGrid$MSE[1] = glmRet_cv1$cvm[glmRet_cv1$lambda == glmRet_cv1$lambda.min]
+glmParamGrid$MSE[2] = glmRet_cv2$cvm[glmRet_cv2$lambda == glmRet_cv2$lambda.min]
+glmParamGrid$MSE[3] = glmRet_cv3$cvm[glmRet_cv3$lambda == glmRet_cv3$lambda.min]
+
+write_csv(glmParamGrid, file = "q3_glm_pgrid.csv")
+
+# Plotting MSE and log(lambda)
+plot(glmRet_cv1); plot(glmRet_cv2); plot(glmRet_cv3)
+
+ggplot() + 
+  ggtitle("Plot of MSE by Lambda") +
+  xlab("Log(Lambda)") + ylab("MSE")+
+  geom_point(aes(y = glmRet_cv1$cvm, x = log(glmRet_cv1$lambda), color="alpha=0") ) + 
+  geom_point(aes(y = glmRet_cv2$cvm, x = log(glmRet_cv2$lambda), color="alpha=0.5")) +
+  geom_point(aes(y = glmRet_cv3$cvm, x = log(glmRet_cv3$lambda), color="alpha=1")) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+
+
+
+# Fitting model on data with non-zero coefficients
+vars_nz<-coef(glmRet_cv3, s="lambda.1se") %>% tidy()
+dim(vars_nz)  # Only 31 variables seemed to have non zero coefficient
+
+nzCoefVars<-vars_nz[-1,1]
+glmRet_nzv <-glm(bs_nDataTrn$annualRet ~ data.matrix(xD%>% select(nzCoefVars)), family=gaussian())
+
+nzCoefVars
+
+summary(glmRet_nzv)
+
+
+plot(glmnet(data.matrix(xD%>% select(nzCoefVars)), bs_nDataTrn$annualRet, family="gaussian", alpha = 0.5))
+
+## Adjusted R-squared value
+print(rsq(glmRet_nzv, adj = T, type = c('sse')))
+
+
+```
+
+# PCA (Reducing dimentionality)
+
+```{r eval=FALSE}
+# One hot encoding for categorical variables
+fdum<-dummyVars(~.,data=xD)
+
+xDnTrn<-predict(fdum, xD)
+
+# Removing columns with 0 variance
+xDnTrn <- xDnTrn[ , which(apply(xDnTrn, 2, var) != 0)]
+dim(xDnTrn)
+
+#perform PCA
+
+xD_pca<-prcomp(xDnTrn, scale=TRUE)
+
+jpeg(filename = "pca.tiff")
+
+plot.new()
+plot( cumsum(xD_pca$sdev/sum(xD_pca$sdev)), ylab= "CumulativeVariance %", xlab= "# components")
+ abline(h=0.9, lty=2) # line to indicate 90% of cumulativeVariance
+
+dev.off()
+
+```
+# Prediction on training data
+
+```{r}
+glm_predTrn <- predict(glmRet_cv3, data.matrix(bs_nDataTrn%>% select(-loan_status, -actualTerm, -annualRet)),s="lambda.min" )
+
+predRet_Trn<-bs_nDataTrn%>% select(grade, loan_status, annualRet, actualTerm, int_rate) %>% mutate(predRet= glm_predTrn )
+
+predRet_Trn<-predRet_Trn%>% mutate(tile=ntile(-predRet, 10))
+
+predRet_Trn%>% group_by(tile) %>% summarise(count=n(), avgpredRet=mean(predRet), numDefaults=sum(loan_status=="Charged Off"), avgActRet=mean(annualRet), minRet=min(annualRet), maxRet=max(annualRet), avgTer=mean(actualTerm), totA=sum(grade=="A"), totB=sum(grade=="B" ), totC=sum(grade=="C"), totD=sum(grade=="D"), totE=sum(grade=="E"), totF=sum(grade=="F") )
+
+print(predRet_Trn)
+#plot ( glm_predTrn, nDataTrn$annualRet)
+
+
+```
+
+# Prediction on test data
+
+```{r}
+
+glm_predTst <- predict(glmRet_cv3, data.matrix(nDataTst%>% select(-loan_status, -actualTerm, -annualRet)),s="lambda.min" )
+
+mean( (glm_predTst- nDataTst$annualRet)^2)
+
+predRet_Tst<-nDataTst%>% select(grade, loan_status, annualRet, actualTerm, int_rate) %>% mutate(predRet=glm_predTst)
+
+predRet_Tst<-predRet_Tst%>% mutate(tile=ntile(-predRet, 10))
+
+write_csv(predRet_Tst%>% group_by(tile) %>% summarise(count=n(), avgpredRet=mean(predRet), numDefaults=sum(loan_status=="Charged Off"), avgActRet=mean(annualRet), minRet=min(annualRet), maxRet=max(annualRet), avgTer=mean(actualTerm), totA=sum(grade=="A"), totB=sum(grade=="B" ), totC=sum(grade=="C"), totD=sum(grade=="D"), totE=sum(grade=="E"), totF=sum(grade=="F") ), 'q3_glm_ntile.csv')
+
+#plot (glm_predTst, nDataTst$annualRet)
+
+
+```
+# XGBoost
+```{r}
+# Using dummyVars for one-hot encoding
+xgD <- nDataLR
+
+fdum<-dummyVars(~.,data=xgD %>% select(-loan_status)) 
+
+dxlcdf<-predict(fdum, xgD)
+dylcdf<-as.data.frame(xgD$annualRet) 
+
+dxTrn<-xgb.DMatrix( subset(as.matrix(dxlcdf[trnIndex,])
+                           , select = -c(annualRet, actualTerm))
+                    , label = as.matrix(dylcdf[trnIndex,]))
+
+dxTst<-xgb.DMatrix( subset( as.matrix(dxlcdf[-trnIndex,])
+                            ,select = -c(annualRet, actualTerm))
+                    , label = as.matrix(dylcdf[-trnIndex,]))
+
+xgbWatchlist<-list(train = dxTrn, eval= dxTst)
+
+#list of parameters for the xgboostmodel development functions
+xgbParam<-list (max_depth= 5, eta = 0.01, objective = "reg:squarederror", eval_metric="rmse", eval_metric= "mae"
+                ,tree_method='hist')
+
+```
+
+# Parameter Grid 
+
+```{r eval=FALSE}
+xgbParamGrid<-expand.grid(
+max_depth= c(5, 7),
+eta = c(0.05, 0.1))
+
+xgbParam<-list (objective = "reg:squarederror", eval_metric="rmse", tree_method='hist')
+
+for(i in 1:nrow(xgbParamGrid)) {
+  xgb_tune<-xgb.cv(data=dxTrn, objective = "reg:squarederror", eval_metric="rmse", tree_method='hist', nrounds=200
+                   ,eta=xgbParamGrid$eta[i],max_depth=xgbParamGrid$max_depth[i]
+                   ,early_stopping_rounds= 10, nfold=10)
+  
+  xgbParamGrid$bestTree[i] <-xgb_tune$evaluation_log[xgb_tune$best_iteration]$iter
+  xgbParamGrid$bestPerf[i] <-xgb_tune$evaluation_log[xgb_tune$best_iteration]$test_rmse_mean
+  
+}
+write_csv(xgbParamGrid, 'q3_xgb_pgrid.csv')
+
+xgbRet <-xgb.train(params=xgbParam, data=dxTrn, nrounds=200, xgbWatchlist, early_stopping_rounds= 10, eta=0.1, max_depth=5)
+
+```
+
+
+# Prediction on test data
+
+```{r}
+xgb_PredRetTst <- predict(xgbRet, dxTst)
+
+mean((xgb_PredRetTst-dylcdf[-trnIndex,])^2)
+
+predRet_Tst<-nDataTst%>% select(grade, loan_status, annualRet, actualTerm, int_rate) %>% mutate(predRet=xgb_PredRetTst)
+
+predRet_Tst<-predRet_Tst%>% mutate(tile=ntile(-predRet, 10))
+
+write_csv(predRet_Tst%>% group_by(tile) %>% summarise(count=n(), avgpredRet=mean(predRet), numDefaults=sum(loan_status=="Charged Off"), avgActRet=mean(annualRet), minRet=min(annualRet), maxRet=max(annualRet), avgTer=mean(actualTerm), totA=sum(grade=="A"), totB=sum(grade=="B" ), totC=sum(grade=="C"), totD=sum(grade=="D"), totE=sum(grade=="E"), totF=sum(grade=="F") ), 'q3_xgb_ntile.csv')
+
+
+```
+
+## 4. Considering results from Questions 1 and 2 above – that is, considering the best model for predicting loan-status and that for predicting loan returns -- how would you select loans for investment? There can be multiple approaches for combining information from the two models - describe your approach, and show performance. How does performance here compare with use of single models?
+
+```{r}
+# MODEL FOR LOAN_STATUS
+# Using XGBoost model as it gave lowest RMSE value in predicting returns and highest AUC in predicting loan_status
+# Using dummyVars function to convert categorical variables into one-hot encoding
+
+fdum<-dummyVars(~.,data=bs_nDataTrn%>% select(-loan_status)) #do not include loan_statusfor this
+
+dxlcdfTrn<-predict(fdum, bs_nDataTrn)
+
+dylcdftrn <- class2ind(bs_nDataTrn$loan_status, drop2nd = FALSE)
+
+# keeping fully paid as label of interest
+colcdfTrn<-dylcdftrn[ , 2]
+
+#Test dataset
+fdum<-dummyVars(~.,data=nDataTst%>% select(-loan_status)) #do not include loan_status for this
+
+dxlcdfTst<-predict(fdum, nDataTst)
+
+dylcdftst <- class2ind(nDataTst$loan_status, drop2nd = FALSE)
+
+# keeping fully paid as label of interest
+colcdfTst<-dylcdftst[ , 2]
+
+dxTrn<-xgb.DMatrix( subset(dxlcdfTrn, select=-c(annualRet, actualTerm)), label=colcdfTrn)
+dxTst<-xgb.DMatrix( subset( dxlcdfTst,select=-c(annualRet, actualTerm)), label=colcdfTst)
+
+```
+# Model building
+```{r}
+xgbWatchlist<-list(train = dxTrn, eval= dxTst)
+
+# list of parameters for the xgboostmodel development functions
+xgbParam<-list (
+max_depth= 5, eta = 0.05,
+objective = "binary:logistic",
+eval_metric="error", eval_metric= "auc")
+
+# can specify which evaluation metrics we want to watch
+xgb_cv <-xgb.cv( xgbParam, dxTrn, nrounds= 500, nfold=5, early_stopping_rounds= 10 )
+
+# the best iteration based on performance measure
+best_cvIter<-which.max(xgb_cv$evaluation_log$test_auc_mean)
+
+max(xgb_cv$evaluation_log$test_auc_mean)
+
+xgb_best<-xgb.train( xgbParam, dxTrn, nrounds= best_cvIter)
+```
+
+
+```{r}
+
+xpredTst<-predict(xgb_best, dxTst)
+scoreTst_xgb_ls<-nDataTst%>% select(grade, loan_status, annualRet, actualTerm, int_rate) %>% mutate(score=xpredTst)
+scoreTst_xgb_ls<-scoreTst_xgb_ls%>% mutate(tile=ntile(-score, 10))
+write_csv(scoreTst_xgb_ls%>% group_by(tile) %>% summarise(count=n(), avgSc=mean(score), numDefaults=sum(loan_status=="Charged Off"), avgActRet=mean(annualRet), minRet=min(annualRet), maxRet=max(annualRet), avgTer=mean(actualTerm), totA=sum(grade=="A"), totB=sum(grade=="B" ), totC=sum(grade=="C"), totD=sum(grade=="D"), totE=sum(grade=="E"), totF=sum(grade=="F") ),'q4_ls_ntile.csv')
+
+
+```
+# Returns Model
+```{r}
+# Using dummyVars for one-hot encoding
+xgD <- nDataLR
+
+fdum<-dummyVars(~.,data=xgD %>% select(-loan_status)) 
+
+dxlcdf<-predict(fdum, xgD)
+dylcdf<-as.data.frame(xgD$annualRet) 
+
+retdxTst<-xgb.DMatrix( subset( as.matrix(dxlcdf[-trnIndex,])
+                            ,select = -c(annualRet, actualTerm))
+                    , label = as.matrix(dylcdf[-trnIndex,]))
+
+xgb_PredRetTst <- predict(xgbRet, retdxTst)
+
+predXgbRet_Tst<-nDataTst%>% select(grade, loan_status, annualRet, actualTerm, int_rate) %>%
+  mutate( predXgbRet=xgb_PredRetTst )
+
+predXgbRet_Tst<-predXgbRet_Tst%>% mutate(tile=ntile(-predXgbRet, 10))
+
+write_csv(predXgbRet_Tst%>% group_by(tile) %>% summarise(count=n(), avgPredRet=mean(predXgbRet), numDefaults=sum(loan_status=="Charged Off"), avgActRet=mean(annualRet), minRet=min(annualRet), maxRet=max(annualRet), avgTer=mean(annualRet), totA=sum(grade=="A"), totB=sum(grade=="B" ), totC=sum(grade=="C"), totD=sum(grade=="D"), totE=sum(grade=="E"), totF=sum(grade=="F") ), 'q4_ret_ntile.csv')
+
+```
+
+# Combining Models
+```{r}
+# Top d deciles
+d=1
+pRetSc<-predXgbRet_Tst%>% mutate(poScore=scoreTst_xgb_ls$score)
+pRet_d<-pRetSc%>% filter(tile<=d)
+pRet_d<-pRet_d%>% mutate(tile2=ntile(-poScore, 20))
+pRet_d%>% group_by(tile2) %>% summarise(count=n(), avgPredRet=mean(predXgbRet), numDefaults=sum(loan_status=="Charged Off"), avgActRet=mean(annualRet), minRet=min(annualRet), maxRet=max(annualRet), avgTer=mean(annualRet), totA=sum(grade=="A"), totB=sum(grade=="B" ),totC=sum(grade=="C"), totD=sum(grade=="D"), totE=sum(grade=="E"), totF=sum(grade=="F") )
+
+
+#considering top d decile from M2
+pRet_d<-pRet_d%>% mutate(expRet=predXgbRet*poScore)
+pRet_d<-pRet_d%>% mutate(tile2=ntile(-expRet, 20))
+write_csv(pRet_d%>% group_by(tile2) %>% summarise(count=n(), avgPredRet=mean(predXgbRet), numDefaults=sum(loan_status=="Charged Off"), avgActRet=mean(annualRet), minRet=min(annualRet), maxRet=max(annualRet), avgTer=mean(annualRet), totA=sum(grade=="A"), totB=sum(grade=="B" ), totC=sum(grade=="C"), totD=sum(grade=="D"), totE=sum(grade=="E"), totF=sum(grade=="F") ), 'q4_exp_ntile.csv')
+```
+
+
+## 5. As seen in data summaries and your work in the first assignment, higher grade loans are less likely to default, but also carry lower interest rates; many lower grad loans are fully paid, and these can yield higher returns. One approach may be to focus on lower grade loans (C and below), and try to identify those which are likely to be paid off. Develop models from the data on lower grade loans, and check if this can provide an effective investment approach – for this, you can use one of the methods (glm, rf, or gbm/xgb) which you find to give superior performance from earlier questions. Can this provide a useful approach for investment? Compare performance with that in Question 4.
+
+# Model on lower grades
+# RF
+```{r}
+lg_nDataTrn<-bs_nDataTrn%>% filter(grade=='C'| grade=='D'| grade== 'E'| grade== 'F'| grade== 'G')
+lg_nDataTst<-nDataTst%>% filter(grade=='C'| grade=='D'| grade== 'E'| grade== 'F'| grade== 'G')
+
+bs_lcdfTrn<-ovun.sample(loan_status~., data = as.data.frame(lg_nDataTrn), na.action= na.pass, method="both", p=0.5)$data
+
+rf_M1_lg <-ranger(loan_status~., data=subset(lg_nDataTrn, select=-c(annualRet, actualTerm)), num.trees=200, probability=TRUE, importance='permutation')
+
+rfPred_lg <- predict(rf_M1_lg,lg_nDataTst)$predictions[,"Fully Paid"]
+
+rfPredauc_lg <- prediction(rfPred_lg, lg_nDataTst$loan_status, label.ordering= c("Charged Off", "Fully Paid"))
+
+rfPredauc_lg <- performance(rfPredauc_lg, "auc")
+rfPredauc_lg@y.values
+
+lg_scoreTstRF<-lg_nDataTst%>% select(grade, loan_status, annualRet, actualTerm, int_rate) %>% mutate(score=(rfPred_lg))
+
+lg_scoreTstRF<-lg_scoreTstRF%>% mutate(tile=ntile(-score, 10))
+
+
+write_csv(lg_scoreTstRF%>% group_by(tile) %>% summarise(count=n(), avgSc=mean(score), numDefaults=sum(loan_status=="Charged Off"), avgAnnRet=mean(annualRet), minRet=min(annualRet), maxRet=max(annualRet), avgTer=mean(actualTerm), totA=sum(grade=="A"), totB=sum(grade=="B" ), totC=sum(grade=="C"), totD=sum(grade=="D"), totE=sum(grade=="E"), totF=sum(grade=="F") ), 'q5_rf_ntile.csv')
+
+
+```
+# GLM
+```{r}
+yTrn<-factor(if_else(lg_nDataTrn$loan_status=="Fully Paid", '1', '0') )
+
+lg_glmLs <-cv.glmnet(data.matrix(subset(lg_nDataTrn, select=-c(annualRet, actualTerm, loan_status))), yTrn
+                 , family="binomial", type.measure="auc", nfolds = 10)
+
+glmPred_lg <- predict(lg_glmLs,data.matrix(subset(lg_nDataTst, select=-c(annualRet, actualTerm, loan_status))), s="lambda.min"
+        , type = "response")
+
+glmPredauc_lg <- prediction(glmPred_lg, lg_nDataTst$loan_status, label.ordering= c("Charged Off", "Fully Paid"))
+
+glmPredauc_lg <- performance(glmPredauc_lg, "auc")
+glmPredauc_lg@y.values
+
+lg_scoreTstglm<-lg_nDataTst%>% select(grade, loan_status, annualRet, actualTerm, int_rate) %>% mutate(score=(glmPred_lg))
+
+lg_scoreTstglm<-lg_scoreTstglm%>% mutate(tile=ntile(-score, 10))
+
+
+write_csv(lg_scoreTstglm%>% group_by(tile) %>% summarise(count=n(), avgSc=mean(score), numDefaults=sum(loan_status=="Charged Off"), avgAnnRet=mean(annualRet), minRet=min(annualRet), maxRet=max(annualRet), avgTer=mean(actualTerm), totA=sum(grade=="A"), totB=sum(grade=="B" ), totC=sum(grade=="C"), totD=sum(grade=="D"), totE=sum(grade=="E"), totF=sum(grade=="F") ), 'q5_glm_ntile.csv')
+
+
+```
+
+# XGBoost
+```{r}
+# Using dummyVars function to convert categorical variables into one-hot encoding
+
+fdum<-dummyVars(~.,data=lg_nDataTrn%>% select(-loan_status)) #do not include loan_statusfor this
+
+dxlcdfTrn<-predict(fdum, lg_nDataTrn)
+
+dylcdftrn <- class2ind(lg_nDataTrn$loan_status, drop2nd = FALSE)
+
+# keeping fully paid as label of interest
+colcdfTrn<-dylcdftrn[ , 2]
+
+#Test dataset
+fdum<-dummyVars(~.,data=lg_nDataTst%>% select(-loan_status)) #do not include loan_status for this
+
+dxlcdfTst<-predict(fdum, lg_nDataTst)
+
+dylcdftst <- class2ind(lg_nDataTst$loan_status, drop2nd = FALSE)
+
+# keeping fully paid as label of interest
+colcdfTst<-dylcdftst[ , 2]
+
+lgdxTrn<-xgb.DMatrix( subset(dxlcdfTrn, select=-c(annualRet, actualTerm)), label=colcdfTrn)
+lgdxTst<-xgb.DMatrix( subset( dxlcdfTst,select=-c(annualRet, actualTerm)), label=colcdfTst)
+
+
+```
+
+# Model building
+```{r}
+
+xgbWatchlist<-list(train = lgdxTrn, eval= dxTst)
+
+# list of parameters for the xgboostmodel development functions
+xgbParam<-list (
+max_depth= 5, eta = 0.05,
+objective = "binary:logistic",
+eval_metric="error", eval_metric= "auc")
+
+# can specify which evaluation metrics we want to watch
+xgb_lgcv <-xgb.cv( xgbParam, lgdxTrn, nrounds= 500, nfold=5, early_stopping_rounds= 10 )
+
+# the best iteration based on performance measure
+best_cvIter<-which.max(xgb_lgcv$evaluation_log$test_auc_mean)
+
+max(xgb_lgcv$evaluation_log$test_auc_mean)
+
+xgb_lgbest<-xgb.train( xgbParam, lgdxTrn, nrounds= best_cvIter)
+
+
+```
+# Ntile analysis
+```{r}
+xgbpredTst_lg<-predict(xgb_lgbest, lgdxTst)
+
+length(xgbpredTst_lg)
+
+dim(lg_nDataTst)
+
+xgbPredauc_lg <- prediction(xgbpredTst_lg, lg_nDataTst$loan_status, label.ordering= c("Charged Off", "Fully Paid"))
+
+xgbPredauc_lg <- performance(xgbPredauc_lg, "auc")
+xgbPredauc_lg@y.values
+
+lg_scoreTstxgb<-lg_nDataTst%>% select(grade, loan_status, annualRet, actualTerm, int_rate) %>% mutate(score=(xgbpredTst_lg))
+
+lg_scoreTstxgb<-lg_scoreTstxgb%>% mutate(tile=ntile(-score, 10))
+
+
+write_csv(lg_scoreTstxgb%>% group_by(tile) %>% summarise(count=n(), avgSc=mean(score), numDefaults=sum(loan_status=="Charged Off"), avgAnnRet=mean(annualRet), minRet=min(annualRet), maxRet=max(annualRet), avgTer=mean(actualTerm), totA=sum(grade=="A"), totB=sum(grade=="B" ), totC=sum(grade=="C"), totD=sum(grade=="D"), totE=sum(grade=="E"), totF=sum(grade=="F") ), 'q5_ntile_xgb.csv')
+
+```
+
